@@ -331,7 +331,7 @@
 		"encodeurl": "^1.0.2",
 		"encoding": "^0.1.13",
 		"end-of-stream": "^1.4.4",
-		"engine.io": "^6.2.0",
+		"engine.io": "^6.2.1",
 		"engine.io-client": "^6.2.2",
 		"engine.io-parser": "^5.0.4",
 		"entities": "^4.4.0",
