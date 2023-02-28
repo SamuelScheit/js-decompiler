@@ -3,3 +3,5 @@ cache
 assets
 input
 .DS_STORE
+modules
+dist
