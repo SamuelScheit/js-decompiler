@@ -1116,7 +1116,7 @@
 		"type-check": "^0.4.0",
 		"type-is": "^1.6.18",
 		"typedarray": "^0.0.6",
-		"ua-parser-js": "^1.0.2",
+		"ua-parser-js": "^1.0.33",
 		"uid-number": "^0.0.6",
 		"uid-safe": "^2.1.5",
 		"ultron": "^1.1.1",
