@@ -5,3 +5,6 @@ input
 .DS_STORE
 modules
 dist
+yarn*
+package-lock.json
+dist

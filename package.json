@@ -18,7 +18,7 @@
 		"@types/babel__generator": "^7.6.4",
 		"@types/babel__traverse": "^7.18.3",
 		"@types/gunzip-maybe": "^1.4.0",
-		"@types/node": "^18.14.1",
+		"@types/node": "^18.14.2",
 		"@types/react": "^18.0.28",
 		"@types/tar-stream": "^2.2.2",
 		"@types/workerpool": "^6.1.1",
