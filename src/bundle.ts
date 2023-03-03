@@ -11,17 +11,22 @@ import { getJSXNode } from "./jsx";
 import { degenerate } from "./generator";
 import { isUnequalOperator, isVariable, isEqualOperator, isUndefined, isEqual } from "./ast";
 
+export function sleep(ms: number) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // const code = fs.readFileSync(__dirname + "/../assets/e948f6857bd5d73d170f.js", "utf8");
 // const code = fs.readFileSync(__dirname + "/../assets/0a996e09af7f3fb26a7b.js", "utf8");
 
-// client.connect();
+const modules = new Map<number, string>();
 
-async function isNodeModule(names: string[]) {
+async function getNodeModule(names: string[]) {
+	if (names.length === 0) return;
 	const entries = await cache.getMultiple(names);
 	const matches = new Collection<string, number>();
 
-	for (const index in names) {
-		const packages = entries[index];
+	for (let i = 0; i < names.length; i++) {
+		const packages = entries[i];
 		if (!packages) continue;
 
 		for (const pkg of packages.split(",")) {
@@ -37,7 +42,7 @@ async function isNodeModule(names: string[]) {
 	const percentage = packages.first()! / names.length;
 	if (percentage < 1) return;
 
-	return true;
+	return packages.firstKey();
 }
 
 export type NodeModule = NodePath<t.ObjectProperty & { key: t.NumericLiteral; value: { body: t.BlockStatement } }>;
@@ -49,10 +54,12 @@ async function processModule(path: NodeModule) {
 	const names = Array.from(new Set(astNames(t.file(t.program(module))).filter((x) => x.length >= 2)));
 	console.log(moduleID, names.length);
 
-	const isNode = await isNodeModule(names);
-	if (!isNode) return;
+	const name = await getNodeModule(names);
+	if (!name) return;
 
-	path.parentPath.remove();
+	modules.set(moduleID, name);
+
+	path.remove();
 }
 
 function isModuleExpression(path: NodePath) {
@@ -77,7 +84,83 @@ async function stripModules(ast: t.File) {
 			tasks.push(processModule(path as NodeModule));
 		},
 	});
+	await simplify(ast);
 	await Promise.all(tasks);
+
+	traverse(ast, {
+		// @ts-ignore
+		enter(path: NodePath<t.ObjectProperty & { key: t.NumericLiteral }>) {
+			if (!isModuleExpression(path)) return;
+
+			path.skip();
+
+			const func = path.get("value") as NodePath<t.ArrowFunctionExpression>;
+			if (func.node.body.type !== "BlockStatement") return;
+
+			const [win, moduleT, webpack] = func.node.params;
+			const moduleId = path.node.key.value;
+			const moduleName = modules.get(moduleId) || moduleId;
+			if (!t.isIdentifier(win) || !t.isIdentifier(moduleT) || !t.isIdentifier(webpack)) return;
+
+			const binding = func.scope.getBinding(webpack.name);
+			if (!binding) return;
+
+			binding.referencePaths.forEach((ref) => {
+				if (ref.parentPath?.isMemberExpression() && ref.parentPath.parentPath.isCallExpression()) {
+					const [, exports] = ref.parentPath.parentPath.get("arguments");
+					if (!exports || !exports.isObjectExpression()) return;
+
+					exports.get("properties").forEach((x) => {
+						if (x.node.type === "ObjectMethod" || x.node.type === "SpreadElement") return;
+						if (x.node.key.type !== "Identifier") return;
+						if (x.node.value.type !== "ArrowFunctionExpression") return;
+						if (x.node.value.body.type !== "Identifier") return;
+						const variable = func.scope.getBinding(x.node.value.body.name);
+						if (!variable) return t.exportSpecifier(x.node.value.body, x.node.key);
+						if (
+							variable.path.node.type !== "FunctionDeclaration" &&
+							variable.path.node.type !== "VariableDeclaration"
+						) {
+							if (variable.path.node.type !== "VariableDeclarator") {
+								return;
+							}
+
+							if (variable.path.parentPath?.parentPath?.isExportNamedDeclaration()) return;
+
+							variable.path = variable.path.parentPath!;
+						}
+
+						variable.path.replaceWith(t.exportNamedDeclaration(variable.path.node as any));
+					});
+
+					exports.parentPath.remove();
+				}
+				if (ref.parentPath?.isCallExpression() && ref.parentPath.parentPath.isVariableDeclarator()) {
+					const args = ref.parentPath.node.arguments;
+					if (args.length !== 1) return;
+					if (args[0].type !== "NumericLiteral") return;
+					if (ref.parentPath.parentPath.node.id?.type !== "Identifier") return;
+					const mod = modules.get(args[0].value) || args[0].value;
+
+					const impo = t.importDeclaration(
+						[t.importDefaultSpecifier(ref.parentPath.parentPath.node.id)],
+						t.stringLiteral("./" + mod)
+					);
+					(func.node.body as t.BlockStatement).body.unshift(impo);
+
+					if (ref.parentPath.parentPath.isVariableDeclarator()) {
+						const x = ref.parentPath.parentPath.parentPath;
+						if (!x.removed) x.remove();
+					}
+				}
+			});
+
+			fs.writeFileSync(
+				__dirname + "/../result/" + moduleName + ".js",
+				generate(t.program(func.node.body.body)).code
+			);
+		},
+	});
 
 	return ast;
 }
@@ -85,7 +168,7 @@ async function stripModules(ast: t.File) {
 async function simplify(ast: t.File) {
 	traverse(ast, {
 		enter(path) {
-			degenerate(path)
+			degenerate(path);
 		},
 		CallExpression(path) {
 			// replace createElement with JSX
@@ -112,8 +195,8 @@ async function simplify(ast: t.File) {
 					hasThis = true;
 				},
 				Function(path) {
-					path.skip()
-				}
+					path.skip();
+				},
 			});
 			if (hasThis) return;
 
@@ -175,8 +258,11 @@ async function simplify(ast: t.File) {
 				alternate.isMemberExpression() &&
 				alternate.node.property.type !== "PrivateName"
 			) {
+				// @ts-ignore
+				alternate.node.type = "OptionalMemberExpression";
 				path.replaceWith(
-					t.optionalMemberExpression(alternate.node.object, alternate.node.property, false, true)
+					alternate.node
+					// t.optionalMemberExpression(alternate.node.object, alternate.node.property, false, true)
 				);
 				return;
 			}
@@ -236,22 +322,19 @@ async function simplify(ast: t.File) {
 	return ast;
 }
 
-async function main(code: string) {
+async function decompile(code: string) {
 	const ast = parse(code, parseOptions);
 
-	// await stripModules(ast);
-	await simplify(ast);
+	await stripModules(ast);
 	console.log("done");
 
-	const stripped = generate(ast).code;
-	fs.writeFileSync(__dirname + `/../result/file.js`, stripped);
-	fs.writeFileSync(__dirname + "/../ast.json", JSON.stringify(ast, null, "\t"));
+	// const stripped = generate(ast).code;
+	// fs.writeFileSync(__dirname + `/../result/file.js`, stripped);
+	// fs.writeFileSync(__dirname + "/../ast.json", JSON.stringify(ast, null, "\t"));
 }
 
-// main(fs.readFileSync(__dirname + "/../assets/1cfddfc1ccaeae49522e.js", "utf8"));
-
 async function test() {
-	const code = fs.readFileSync(__dirname + "/../result/generator.js", "utf8");
+	const code = fs.readFileSync(__dirname + "/../result/input.js", "utf8");
 	const ast = parse(code, parseOptions);
 	fs.writeFileSync(__dirname + "/../result/ast.json", JSON.stringify(ast, null, "\t"));
 
@@ -262,4 +345,14 @@ async function test() {
 	fs.writeFileSync(__dirname + "/../result/code.js", stripped);
 }
 
-test();
+async function main() {
+	await client.connect();
+
+	for (const file of fs.readdirSync(__dirname + "/../assets")) {
+		if (!file.endsWith(".js")) continue;
+		// await sleep(1000);
+		await decompile(fs.readFileSync(__dirname + `/../assets/${file}`, "utf8"));
+	}
+}
+
+main();
