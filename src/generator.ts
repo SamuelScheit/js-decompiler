@@ -1,6 +1,7 @@
 import { NodePath } from "@babel/traverse";
 import * as t from "@babel/types";
 import { Collection } from "@discordjs/collection";
+import "./util";
 
 enum TypeScriptOpCode {
 	Nop = 0,
@@ -8,9 +9,10 @@ enum TypeScriptOpCode {
 	Break = 3, // A break instruction used to jump to a label
 	Yield = 4, // A completion instruction for the `yield` keyword
 	Endfinally = 7, // Marks the end of a `finally` block
-	Try = 10,
-	Catch = 11,
-	Finally = 12,
+	Try = 8, // Marks the start of a `try` block
+	Catch = 9, // Marks the start of a `catch` block
+	Finally = 10, // Marks the start of a `finally` block
+	EndBlock = 11, // Marks the start of a `finally` block
 }
 
 export function getTSGenerator(path: NodePath) {
@@ -48,9 +50,10 @@ type Case = {
 	path: CasePath;
 	number: number;
 	result?: NodePath;
-	try?: boolean | number;
-	catch?: boolean | number;
-	finally?: boolean | number;
+	try?: number;
+	catch?: number;
+	finally?: number;
+	next?: number;
 	links: {
 		type: TypeScriptOpCode;
 		next?: number;
@@ -71,12 +74,16 @@ function getCycles(cases: Collection<number, Case>) {
 			if (!next) return;
 
 			if (seen.has(x.next!)) {
+				const exists = cycles.get(x.next!);
 				const nums = [...seen].filter((x) => x > next.number);
 				for (const x of nums) {
 					all.delete(x);
 				}
 				if (cycles.has(x.next!)) {
-					cycles.set(x.next!, [...new Set([...cycles.get(x.next!)!, ...nums])].sort());
+					cycles.set(
+						x.next!,
+						[...exists!, ...nums].unique().sort((x, y) => x - y)
+					);
 					return;
 				}
 				return cycles.set(x.next!, nums);
@@ -84,6 +91,7 @@ function getCycles(cases: Collection<number, Case>) {
 
 			getCycle(next, new Set([...seen]));
 		});
+
 		return seen;
 	}
 
@@ -159,67 +167,77 @@ export function degenerate(path: NodePath) {
 		let next: number | undefined;
 		let links = [] as Case["links"];
 		let result: NodePath | undefined;
-		let _try: number | boolean | undefined;
-		let _catch: number | boolean | undefined;
-		let _finally: number | boolean | undefined;
-		let _if: number | boolean | undefined;
+		let _try = trys.get(number);
+		let _catch = catches.get(number);
+		let _finally = finallys.get(number);
 
-		if (trys.has(number)) {
+		if (_try) {
 			links.push({
+				type: TypeScriptOpCode.EndBlock,
+				next: _try,
 				path: step,
-				type: TypeScriptOpCode.Try,
-				next: trys.get(number),
 			});
-			_try = true;
+			_try = undefined;
 		}
-		if (catches.has(number)) {
+		if (_catch) {
 			links.push({
+				type: TypeScriptOpCode.EndBlock,
+				next: _catch,
 				path: step,
-				type: TypeScriptOpCode.Catch,
-				next: catches.get(number),
 			});
-			_catch = true;
+			_catch = undefined;
 		}
-		if (finallys.has(number)) {
+		if (_finally) {
 			links.push({
+				type: TypeScriptOpCode.EndBlock,
+				next: _finally,
 				path: step,
-				type: TypeScriptOpCode.Finally,
-				next: finallys.get(number),
 			});
-			_finally = true;
+			_finally = undefined;
 		}
 
-		step.traverse({
-			ReturnStatement(x) {
-				const argument = x.get("argument");
-				if (!argument.isArrayExpression()) return;
+		function ReturnStatement(x: NodePath<t.ReturnStatement>) {
+			const argument = x.get("argument");
+			if (argument.isConditionalExpression()) {
+				const ifStatement = t.ifStatement(
+					argument.get("test").node,
+					t.returnStatement(argument.get("consequent").node),
+					t.returnStatement(argument.get("alternate").node)
+				);
 
-				const elements = argument.get("elements").filter((x) => x) as NodePath<
-					t.SpreadElement | t.Expression
-				>[];
-				if (elements.length > 2) return;
+				x.replaceWith(ifStatement);
 
-				const [op, value] = elements;
-				if (!op?.isNumericLiteral()) return;
-				opcode = op.node.value as TypeScriptOpCode;
+				const ifX = x as unknown as NodePath<t.IfStatement>;
 
-				if (value?.isNumericLiteral()) {
-					next = value.node.value;
-					x.node.argument = null;
-				} else if (opcode === TypeScriptOpCode.Return) {
-					promise = value;
-				} else if (opcode === TypeScriptOpCode.Yield) {
-					promise = value;
-					next = test.node.value + 1;
-				} else if (opcode === TypeScriptOpCode.Endfinally) {
-					next = test.node.value + 1;
-					_finally = true;
-					return;
-				}
+				ReturnStatement(ifX.get("consequent") as NodePath<t.ReturnStatement>);
+				ReturnStatement(ifX.get("alternate") as NodePath<t.ReturnStatement>);
+				return;
+			}
+			if (!argument.isArrayExpression()) return;
 
-				links.push({ type: opcode, next, promise, path: x });
-			},
-		});
+			const elements = argument.get("elements").filter((x) => x) as NodePath<t.SpreadElement | t.Expression>[];
+			if (elements.length > 2) return;
+
+			const [op, value] = elements;
+			if (!op?.isNumericLiteral()) return;
+			opcode = op.node.value as TypeScriptOpCode;
+
+			if (value?.isNumericLiteral()) {
+				next = value.node.value;
+				x.node.argument = null;
+			} else if (opcode === TypeScriptOpCode.Return) {
+				promise = value;
+			} else if (opcode === TypeScriptOpCode.Yield) {
+				promise = value;
+				next = number + 1;
+			} else if (opcode === TypeScriptOpCode.Endfinally) {
+				next = number + 1;
+				_finally = number;
+			}
+
+			links.push({ type: opcode, next, promise, path: x });
+		}
+		step.traverse({ ReturnStatement });
 
 		const binding = step.scope.getBinding(object.node.name);
 
@@ -233,7 +251,7 @@ export function degenerate(path: NodePath) {
 				const next = label.get("right");
 				if (next.isNumericLiteral()) {
 					links.push({ type: TypeScriptOpCode.Nop, next: next.node.value, path: label });
-					label.remove();
+					// label.remove();
 				}
 			}
 			if (call) {
@@ -253,23 +271,22 @@ export function degenerate(path: NodePath) {
 					_try = try_?.isNumericLiteral() ? try_.node.value : undefined;
 					_catch = catch_?.isNumericLiteral() ? catch_.node.value : undefined;
 					_finally = finally_?.isNumericLiteral() ? finally_.node.value : undefined;
-					let next = next_?.isNumericLiteral() ? next_.node.value : undefined;
+					next = next_?.isNumericLiteral() ? next_.node.value : undefined;
 					// @ts-ignore
 
-					if (_try) {
-						if (cases.has(_try)) cases.get(_try)!.try = true;
-						links.push({ type: TypeScriptOpCode.Try, next: _try, path: call });
-					}
+					if (_try) _try++;
 					if (_catch) {
-						trys.set(_catch - 1, _try!);
-						links.push({ type: TypeScriptOpCode.Catch, next: _catch, path: call });
+						trys.set(_catch - 1, next!);
 					}
 					if (_finally) {
-						if (_catch) catches.set(_finally - 1, _catch);
-						else trys.set(_finally - 1, _try!);
-						finallys.set(next! - 1, _finally);
-						links.push({ type: TypeScriptOpCode.Finally, next: _finally, path: call });
+						if (_catch) catches.set(_finally - 1, next!);
+						else trys.set(_finally - 1, next!);
 					}
+					if (next) {
+						finallys.set(next - 1, next);
+					}
+
+					// links.push({ type: TypeScriptOpCode.Try, next, path: call });
 				} else if (name === "sent") {
 					// await promise
 					result = call;
@@ -285,6 +302,7 @@ export function degenerate(path: NodePath) {
 			try: _try,
 			catch: _catch,
 			finally: _finally,
+			next,
 		});
 	});
 
@@ -292,9 +310,10 @@ export function degenerate(path: NodePath) {
 		cases.map((x) => ({
 			number: x.number,
 			links: x.links.map((x) => ({ type: x.type, next: x.next })),
-			t: !!x.try,
-			c: !!x.catch,
-			f: !!x.finally,
+			t: x.try,
+			c: x.catch,
+			f: x.finally,
+			n: x.next,
 		})),
 		{ depth: null, breakLength: 140 }
 	);
@@ -305,60 +324,64 @@ export function degenerate(path: NodePath) {
 	const cycles = getCycles(cases);
 	console.log("cycles", cycles);
 
-	function recursive(nodes: number[]): t.BlockStatement {
-		let x = [] as any[];
+	function recursive(num: number): t.Statement[] {
+		const cycle = cycles.get(num);
+		const branch = branches.get(num);
+		const c = cases.get(num);
+		if (!c) return [];
+		var node = getCase(c);
 
-		for (const num of nodes) {
-			const cycle = cycles.get(num);
-			const branch = branches.get(num);
-			const c = cases.get(num);
-			if (!c) continue;
-			if (cycle !== undefined) {
-				const stmt = recursive(cycle);
-				stmt.body.unshift(...getCase(c));
-				stmt.body.splice(-1, 1);
-				if (c.try != null) {
-					x.push(t.tryStatement(stmt, null, null));
-				} else if (c.catch != null) {
-					x[x.length - 1].handler = t.catchClause(t.identifier("e"), stmt);
-				} else if (c.finally != null) {
-					x[x.length - 1].finalizer = stmt;
-				} else {
-					x.push(t.whileStatement(t.identifier("true"), stmt));
-				}
-				continue;
+		if (c.links.some((x) => x.type === TypeScriptOpCode.EndBlock)) return node;
+
+		if (cycle !== undefined) {
+			const stmt = recursive(cycle[0]);
+			stmt.unshift(...node);
+
+			return [t.whileStatement(t.identifier("true"), t.blockStatement(stmt))];
+		}
+		if (c.try) {
+			return [
+				t.tryStatement(
+					t.blockStatement(recursive(c.try!)),
+					t.catchClause(t.identifier("e"), t.blockStatement(recursive(c.catch!))),
+					t.blockStatement(recursive(c.finally!))
+				),
+				...recursive(c.next!),
+			];
+		}
+		if (branch !== undefined) {
+			const link = c.links.find((x) => x.next === branch);
+			if (!link) return [];
+			const if_ = link?.path.find((x) => x.isIfStatement()) as NodePath<t.IfStatement>;
+			console.log("branch", num, link?.next);
+			const next = recursive(link!.next!);
+
+			if (if_) {
+				if_.node.consequent = t.blockStatement(next);
+				const alternate = c.links.find((x) => x.next !== branch);
+				if (alternate) if_.node.alternate = t.blockStatement(recursive(alternate.next!));
+
+				return node;
 			}
-			if (branch !== undefined) {
-				const link = c.links.find((x) => x.next === branch);
-				const if_ = link?.path.find((x) => x.isIfStatement())?.node as t.IfStatement;
-				if (link && if_) {
-					if_.consequent = t.blockStatement(getCase(c));
-					if_.alternate = t.blockStatement(getCase(cases.get(link?.next!)!));
-					x.push(if_);
-					// console.log("branch", num, link.next);
-				}
 
-				continue;
-			}
-
-			x.push(...getCase(c));
+			return [...node, ...next];
 		}
 
-		return t.blockStatement(x);
+		if (c.links[0]?.next! < num) return node;
+
+		return [...node, ...recursive(c.links[0]?.next!)];
 	}
 
-	const result = recursive(cycles.first()!);
+	const result = recursive(cycles.first()![0]);
 	const parent = path.find((x) => x.isFunctionExpression()) as NodePath<t.FunctionExpression>;
 	if (!parent) return;
 
 	const variables = parent.node.body.body.filter((x) => x.type === "VariableDeclaration");
 	const head = parent.findParent((x) => x.isCallExpression()) as NodePath<t.CallExpression>;
-	if (!head) return;
-	head.replaceWith(t.functionExpression(null, [], t.blockStatement([...variables, ...result.body])));
+	head?.replaceWith(t.functionExpression(null, [], t.blockStatement([...variables, ...result]), false, true));
 
 	function getCase(c: Case) {
 		if (!c) return c;
-
 		const x = c.path.node.consequent;
 
 		c.links.forEach((x) => {
@@ -369,22 +392,25 @@ export function degenerate(path: NodePath) {
 			}
 
 			if (x.type === TypeScriptOpCode.Yield) {
-				// x.path.remove();
+				if (!x.path.removed) x.path.remove();
 			} else if (x.type === TypeScriptOpCode.Break) {
-				x.path.replaceWith(t.breakStatement());
+				const partOfCycle = cycles.filter((x, k) => k !== -1).some((c) => c.includes(x.next!));
+
+				if (cycles.get(x.next!) || partOfCycle || c.finally || c.catch || c.try) {
+					if (!x.path.removed) x.path.remove();
+				} else {
+					x.path.replaceWith(t.breakStatement());
+				}
 			} else if (x.type === TypeScriptOpCode.Return) {
 				x.path.replaceWith(t.returnStatement(x.promise?.node as t.Expression));
-			} else if (x.type === TypeScriptOpCode.Try) {
-				x.path.remove();
+			} else if (x.type === TypeScriptOpCode.Endfinally) {
+				if (!x.path.removed) x.path.remove();
+			} else if (x.type === TypeScriptOpCode.Nop) {
+				if (!x.path.removed) x.path.remove();
+			} else if (x.type === TypeScriptOpCode.EndBlock) {
 			}
-
-			// c.path.pushContainer("body", next.path.node);
-			// c.path.get("body").push(next.path);
-			// c.path.insertAfter(next.path.node)
 		});
 
 		return x;
 	}
-
-	// getCase(first);
 }

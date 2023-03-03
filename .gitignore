@@ -8,3 +8,4 @@ dist
 yarn*
 package-lock.json
 dist
+result

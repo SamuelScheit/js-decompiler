@@ -12,3 +12,14 @@ function reviver(key: any, value: any) {
 export function JSONParse(text: string) {
 	return JSON.parse(text, reviver);
 }
+
+
+Array.prototype.unique = function () {
+	return this.filter((value, index, self) => self.indexOf(value) === index);
+}
+
+declare global {
+	interface Array<T> {
+		unique(): Array<T>;
+	}
+}
